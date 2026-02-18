@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+data/documents/
+data/index/
+*.npy
+tests/

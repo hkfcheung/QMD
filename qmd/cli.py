@@ -8,6 +8,38 @@ import click
 
 from qmd import __version__
 
+# Output token cost per 1M tokens by model prefix
+_OUTPUT_COST_PER_M = {
+    "gpt-4.1-nano": 0.40,
+    "gpt-4.1-mini": 1.60,
+    "gpt-4.1": 8.00,
+    "gpt-4o-mini": 0.60,
+    "gpt-4o": 10.00,
+    "gpt-5.2": 14.00,
+    "claude-haiku": 1.25,
+    "claude-sonnet": 15.00,
+    "claude-opus": 75.00,
+}
+
+
+def _print_usage(usage: dict) -> None:
+    """Print output token count and estimated cost."""
+    import os
+
+    model = os.environ.get("OPENAI_MODEL") or os.environ.get("ANTHROPIC_MODEL") or ""
+    out_tokens = usage.get("output_tokens", 0)
+    # Find matching cost rate
+    cost_per_m = None
+    for prefix, rate in _OUTPUT_COST_PER_M.items():
+        if model.startswith(prefix):
+            cost_per_m = rate
+            break
+    if cost_per_m is not None:
+        est_cost = out_tokens * cost_per_m / 1_000_000
+        click.echo(f"  Tokens: {out_tokens} output | ~${est_cost:.6f}")
+    else:
+        click.echo(f"  Tokens: {out_tokens} output")
+
 
 @click.group()
 @click.version_option(version=__version__, prog_name="qmd")
@@ -235,17 +267,128 @@ def query(query_text: str, index_dir: Path, top_k: int, no_synth: bool) -> None:
 
             click.echo("---")
             click.echo("Synthesizing answer...\n")
-            answer = synthesize_answer(query_text, results)
+            answer, usage = synthesize_answer(query_text, results)
             click.echo(f"Answer:\n  {answer.replace(chr(10), chr(10) + '  ')}")
 
             sources = sorted({r.chunk.file_name for r in results})
             click.echo(f"\n  Sources: {', '.join(sources)}")
+            _print_usage(usage)
         except ImportError:
             pass  # LLM deps not installed, skip silently
         except RuntimeError as e:
             click.echo(f"\n  [skip] {e}")
         except Exception as e:
             click.echo(f"\n  [warn] Synthesis failed: {e}")
+
+
+@main.command()
+@click.argument("query_text")
+@click.option(
+    "--index", "index_dir",
+    default=Path("data/index"),
+    show_default=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Index directory (must contain chunks.jsonl).",
+)
+@click.option(
+    "-k", "--top-k", "top_k",
+    default=10,
+    show_default=True,
+    help="Number of results to return.",
+)
+def chat(query_text: str, index_dir: Path, top_k: int) -> None:
+    """Interactive follow-up chat over retrieved documents."""
+    import os
+    from qmd.index_store import load_chunks
+    from qmd.hybrid import hybrid_search
+    from qmd.search_embed import load_embeddings
+    from qmd.synthesize import build_context, chat_turn, detect_provider
+    from qmd.search_bm25 import SearchResult as _SR
+
+    try:
+        chunks = load_chunks(index_dir)
+    except FileNotFoundError as e:
+        raise click.ClickException(str(e))
+
+    if not chunks:
+        raise click.ClickException("Index is empty. Run 'qmd ingest' first.")
+
+    provider = detect_provider()
+    if provider is None:
+        raise click.ClickException(
+            "No LLM API key found. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in .env"
+        )
+
+    results = hybrid_search(chunks, query_text, index_dir, top_k=top_k)
+
+    embeddings = load_embeddings(index_dir)
+    mode = "hybrid" if embeddings is not None and len(embeddings) == len(chunks) else "BM25-only"
+
+    if not results:
+        click.echo(f'No results for: "{query_text}"')
+        return
+
+    click.echo(f'Query: "{query_text}"  [{mode}]')
+    click.echo(f"Results: {len(results)} (from {len(chunks)} chunks)\n")
+
+    for r in results:
+        snippet = r.chunk.text[:200]
+        if len(r.chunk.text) > 200:
+            snippet += "..."
+        snippet = snippet.replace("\n", " ")
+        click.echo(f"  [{r.rank}] score={r.score:.4f}  {r.chunk.file_name}")
+        click.echo(f"      chunk: {r.chunk.chunk_id}")
+        click.echo(f"      {snippet}")
+        click.echo()
+
+    # Expand context: pull additional chunks from matched files
+    context_limit = int(os.environ.get("CHAT_CONTEXT_CHUNKS", "15"))
+    hit_files = {r.chunk.file_name for r in results}
+    hit_chunk_ids = {r.chunk.chunk_id for r in results}
+
+    extra = [
+        _SR(chunk=c, score=0.0, rank=0)
+        for c in chunks
+        if c.file_name in hit_files and c.chunk_id not in hit_chunk_ids
+    ]
+
+    # Combine: original ranked results + extra chunks, capped at limit
+    all_context = list(results) + extra
+    all_context = all_context[:context_limit]
+
+    click.echo(f"  Context: {len(all_context)} chunks from {len(hit_files)} file(s)\n")
+
+    # Build context and start chat
+    context = build_context(all_context)
+    conversation: list[dict] = []
+
+    click.echo("---")
+    click.echo("Thinking...\n")
+    answer, usage = chat_turn(query_text, conversation, context, provider=provider)
+    click.echo(f"Answer:\n  {answer.replace(chr(10), chr(10) + '  ')}")
+
+    sources = sorted(hit_files)
+    click.echo(f"\n  Sources: {', '.join(sources)}")
+    _print_usage(usage)
+    click.echo()
+
+    # Interactive loop
+    while True:
+        try:
+            user_input = click.prompt("You", default="", show_default=False).strip()
+        except (EOFError, KeyboardInterrupt):
+            click.echo("\nBye!")
+            break
+
+        if not user_input or user_input.lower() in ("exit", "quit", "q"):
+            click.echo("Bye!")
+            break
+
+        click.echo()
+        reply, usage = chat_turn(user_input, conversation, context, provider=provider)
+        click.echo(f"Answer:\n  {reply.replace(chr(10), chr(10) + '  ')}")
+        _print_usage(usage)
+        click.echo()
 
 
 if __name__ == "__main__":

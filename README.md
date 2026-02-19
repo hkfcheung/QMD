@@ -34,6 +34,7 @@ qmd info
 - **Hybrid search**: BM25 lexical + semantic embedding search fused with Reciprocal Rank Fusion
 - **Fuzzy matching**: Handles typos and OCR errors
 - **LLM synthesis**: Optional RAG-powered answer generation (OpenAI / Anthropic)
+- **Interactive chat**: Follow-up conversation over retrieved documents with general AI knowledge
 - **Incremental indexing**: Only reprocesses files whose content has changed
 - **Local-first**: All indexing and search runs locally; LLM calls are optional
 
@@ -90,6 +91,7 @@ pytest -v
 | `qmd ingest --input <dir> --out <index_dir>` | Ingest and chunk files |
 | `qmd query "<search terms>"` | Search with hybrid ranking + LLM synthesis |
 | `qmd query "<terms>" --no-synth` | Search without LLM synthesis |
+| `qmd chat "<search terms>"` | Interactive chat over retrieved documents |
 | `qmd info` | Show index statistics |
 | `qmd --version` | Show version |
 

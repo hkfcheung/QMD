@@ -19,6 +19,11 @@ SYSTEM_PROMPT = (
     "Be concise and direct. Cite which source file(s) your answer comes from."
 )
 
+CHAT_SYSTEM_PROMPT = (
+    "The user will share document excerpts as context. Answer their questions directly "
+    "using both the documents and your general knowledge. Be concise."
+)
+
 
 def detect_provider() -> str | None:
     """Detect which LLM provider to use based on available API keys.
@@ -71,36 +76,87 @@ def synthesize_answer(
         )
 
     context = build_context(results)
-    user_message = f"Context:\n{context}\n\nQuestion: {query}"
+    messages = [{"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"}]
 
     if provider == "openai":
-        return _call_openai(user_message)
+        reply, usage = _call_openai(messages)
+        return reply, usage
     elif provider == "anthropic":
-        return _call_anthropic(user_message)
+        reply, usage = _call_anthropic(messages)
+        return reply, usage
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
 
-def _call_openai(user_message: str) -> str:
-    """Call OpenAI API for answer synthesis."""
+def chat_turn(
+    user_message: str,
+    conversation: list[dict],
+    context: str,
+    provider: str | None = None,
+) -> str:
+    """Send a follow-up message in a multi-turn conversation.
+
+    Args:
+        user_message: The user's follow-up question.
+        conversation: Mutable list of {"role": ..., "content": ...} dicts.
+            Updated in-place with the new user and assistant messages.
+        context: The document context string (from build_context).
+        provider: 'openai', 'anthropic', or None (auto-detect).
+
+    Returns:
+        The assistant's response string.
+    """
+    if provider is None:
+        provider = detect_provider()
+    if provider is None:
+        raise RuntimeError(
+            "No LLM API key found. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in .env"
+        )
+
+    # On the first turn, prepend the document context
+    if not conversation:
+        full_message = f"Context:\n{context}\n\nQuestion: {user_message}"
+    else:
+        full_message = user_message
+
+    conversation.append({"role": "user", "content": full_message})
+
+    if provider == "openai":
+        reply, usage = _call_openai(conversation, system_prompt=CHAT_SYSTEM_PROMPT)
+    elif provider == "anthropic":
+        reply, usage = _call_anthropic(conversation, system_prompt=CHAT_SYSTEM_PROMPT)
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
+
+    conversation.append({"role": "assistant", "content": reply})
+    return reply, usage
+
+
+def _call_openai(messages: list[dict], system_prompt: str = SYSTEM_PROMPT) -> str:
+    """Call OpenAI API with a full message history."""
     from openai import OpenAI
 
     model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
     client = OpenAI()
-    response = client.chat.completions.create(
+    kwargs = dict(
         model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
+        messages=[{"role": "system", "content": system_prompt}] + messages,
         temperature=0.2,
-        max_tokens=1024,
     )
-    return response.choices[0].message.content
+    if model.startswith("gpt-5"):
+        kwargs["max_completion_tokens"] = 1024
+    else:
+        kwargs["max_tokens"] = 1024
+    response = client.chat.completions.create(**kwargs)
+    usage = response.usage
+    return response.choices[0].message.content, {
+        "output_tokens": usage.completion_tokens,
+        "input_tokens": usage.prompt_tokens,
+    }
 
 
-def _call_anthropic(user_message: str) -> str:
-    """Call Anthropic API for answer synthesis."""
+def _call_anthropic(messages: list[dict], system_prompt: str = SYSTEM_PROMPT) -> str:
+    """Call Anthropic API with a full message history."""
     from anthropic import Anthropic
 
     model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
@@ -108,10 +164,11 @@ def _call_anthropic(user_message: str) -> str:
     response = client.messages.create(
         model=model,
         max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[
-            {"role": "user", "content": user_message},
-        ],
+        system=system_prompt,
+        messages=messages,
         temperature=0.2,
     )
-    return response.content[0].text
+    return response.content[0].text, {
+        "output_tokens": response.usage.output_tokens,
+        "input_tokens": response.usage.input_tokens,
+    }
